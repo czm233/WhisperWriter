@@ -6,3 +6,4 @@ model = whisper.load_model("large")
 python -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118
 注意pip install openai-whisper而不是whisper
 注意录音设备录音的默认格式
+whisper还是webrtcvad的编译需要https://visualstudio.microsoft.com/zh-hans/visual-cpp-build-tools/
