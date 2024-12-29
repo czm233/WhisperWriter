@@ -1,0 +1,5 @@
+/.venv
+*.mp3
+*.wav
+*.xml
+*.iml
