@@ -5,6 +5,18 @@ import numpy as np
 import wave
 import io
 import time
+import threading
+import queue
+import logging
+
+# 配置日志
+logging.basicConfig(filename='transcription_errors.log',
+                    level=logging.ERROR,
+                    format='%(asctime)s:%(levelname)s:%(message)s')
+
+# ===========================
+# 1. 初始化 Whisper 模型
+# ===========================
 
 def init_whisper_model(model_name="large", device=None):
     """
@@ -19,32 +31,46 @@ def init_whisper_model(model_name="large", device=None):
     model = whisper.load_model(model_name).to(device)
     return model
 
-def record_audio(p, record_seconds=3, rate=16000, chunk=1024, channels=1, format_=pyaudio.paInt16):
+# ===========================
+# 2. 录音函数
+# ===========================
+
+def record_audio(p, audio_queue, record_seconds=2, rate=16000, chunk=1024, channels=1, format_=pyaudio.paInt16):
     """
-    录制音频数据并返回字节流（wav 格式）。
+    持续录制音频，并将录制的音频块放入队列中。
     """
     stream = p.open(format=format_,
                     channels=channels,
                     rate=rate,
                     input=True,
                     frames_per_buffer=chunk)
-    print("录音中...")
-    frames = []
-    for _ in range(0, int(rate / chunk * record_seconds)):
-        data = stream.read(chunk)
-        frames.append(data)
-    stream.stop_stream()
-    stream.close()
+    print("录音线程已启动。")
+    try:
+        while True:
+            frames = []
+            for _ in range(0, int(rate / chunk * record_seconds)):
+                data = stream.read(chunk, exception_on_overflow=False)
+                frames.append(data)
+            # 将录音数据转换为 WAV 字节流
+            wav_buffer = io.BytesIO()
+            with wave.open(wav_buffer, 'wb') as wf:
+                wf.setnchannels(channels)
+                wf.setsampwidth(p.get_sample_size(format_))
+                wf.setframerate(rate)
+                wf.writeframes(b''.join(frames))
+            audio_data = wav_buffer.getvalue()
+            # 将音频数据放入队列
+            audio_queue.put(audio_data)
+    except Exception as e:
+        logging.error(f"录音线程出现错误: {e}")
+    finally:
+        stream.stop_stream()
+        stream.close()
+        print("录音线程已停止。")
 
-    # 将录音数据写入 BytesIO，形成一个合法的 WAV 文件字节流
-    wav_buffer = io.BytesIO()
-    with wave.open(wav_buffer, 'wb') as wf:
-        wf.setnchannels(channels)
-        wf.setsampwidth(p.get_sample_size(format_))
-        wf.setframerate(rate)
-        wf.writeframes(b''.join(frames))
-
-    return wav_buffer.getvalue()
+# ===========================
+# 3. WAV 字节流转换为 NumPy 数组
+# ===========================
 
 def wav_bytes_to_float32(audio_bytes):
     """
@@ -53,71 +79,93 @@ def wav_bytes_to_float32(audio_bytes):
     """
     with wave.open(io.BytesIO(audio_bytes), 'rb') as wav_file:
         num_channels = wav_file.getnchannels()
-        sample_width = wav_file.getsampwidth()  # 一般是 2 表示 16-bit
+        sample_width = wav_file.getsampwidth()
         framerate = wav_file.getframerate()
         num_frames = wav_file.getnframes()
         raw_data = wav_file.readframes(num_frames)
 
-    # 根据声道数与位宽将数据转换为 numpy 数组
     if sample_width == 2:
-        audio_np = np.frombuffer(raw_data, dtype=np.int16)  # 16-bit PCM
-        # 转为 float32，并缩放到 [-1, 1]
+        audio_np = np.frombuffer(raw_data, dtype=np.int16)
         audio_float32 = audio_np.astype(np.float32) / 32768.0
     else:
-        # 如果有其他格式，需根据实际情况做更多判断
-        raise ValueError("仅示例支持 16-bit PCM 音频")
+        raise ValueError("仅支持 16-bit PCM 音频")
 
-    # 如果有多声道，可只取第一声道或做混合
     if num_channels > 1:
-        # 例如只取第一个声道
         audio_float32 = audio_float32[0::num_channels]
 
     return audio_float32, framerate
 
-def transcribe_audio(model, audio_data, language="zh", fp16=False):
-    """
-    使用 Whisper 模型转写给定音频（在内存中的 WAV 字节）。
-    """
-    # 1) 将 WAV 字节流转换为 float32 waveform
-    audio_array, sample_rate = wav_bytes_to_float32(audio_data)
+# ===========================
+# 4. 转录函数
+# ===========================
 
-    # 2) 调用 whisper transcribe
-    #    如果在 CPU 上运行或显存不足，可将 fp16=False
-    result = model.transcribe(audio_array, language=language, fp16=fp16)
-    return result["text"]
+def transcribe_audio(model, audio_queue, stop_event, language="zh", fp16=False):
+    """
+    从音频队列中获取音频数据并进行转录。
+    """
+    print("转录线程已启动。")
+    while not stop_event.is_set():
+        try:
+            # 尝试获取音频数据，超时可避免阻塞退出
+            audio_data = audio_queue.get(timeout=1)
+        except queue.Empty:
+            continue
+
+        try:
+            audio_array, sample_rate = wav_bytes_to_float32(audio_data)
+            # Whisper expects audio to be 16000 Hz; resample if necessary
+            if sample_rate != 16000:
+                import librosa
+                audio_array = librosa.resample(audio_array, orig_sr=sample_rate, target_sr=16000)
+            result = model.transcribe(audio_array, language=language, fp16=fp16)
+            text = result["text"].strip()
+
+            if text:
+                print(f"识别结果: {text}")
+                print("-" * 40)
+            else:
+                print("未识别到有效文本。")
+        except Exception as e:
+            logging.error(f"转录线程出现错误: {e}")
+            print("转录过程中出现错误，检查日志以获取详细信息。")
+    print("转录线程已停止。")
+
+# ===========================
+# 5. 主函数
+# ===========================
 
 def main():
-    # 1. 初始化 PyAudio 和模型
+    # 初始化 PyAudio
     p = pyaudio.PyAudio()
-    model = init_whisper_model(model_name="large")  # 或 "medium"/"small"/"tiny" 以加快速度
+
+    # 初始化 Whisper 模型
+    model = init_whisper_model(model_name="large")  # 可以根据需求调整模型大小
+
+    # 创建一个线程安全的队列用于传递音频数据
+    audio_queue = queue.Queue()
+
+    # 创建一个事件用于停止线程
+    stop_event = threading.Event()
+
+    # 启动录音线程
+    recording_thread = threading.Thread(target=record_audio, args=(p, audio_queue), daemon=True)
+    recording_thread.start()
+
+    # 启动转录线程
+    transcription_thread = threading.Thread(target=transcribe_audio, args=(model, audio_queue, stop_event), daemon=True)
+    transcription_thread.start()
 
     print("开始实时语音翻译...按 Ctrl+C 结束。")
     try:
         while True:
-            # 2. 录音并获取内存中的 wav 字节流
-            audio_data = record_audio(
-                p,
-                record_seconds=3,
-                rate=16000,
-                chunk=1024,
-                channels=1,
-                format_=pyaudio.paInt16
-            )
-
-            # 3. 转写
-            print("识别中...")
-            recognized_text = transcribe_audio(model, audio_data, language="zh", fp16=False)
-
-            # 4. 打印结果
-            if recognized_text.strip():
-                print(f"识别结果: {recognized_text}")
-                print("-" * 40)
-
-            time.sleep(0.1)
-
+            time.sleep(0.1)  # 主线程保持活跃
     except KeyboardInterrupt:
         print("停止实时语音翻译。")
+        stop_event.set()
     finally:
+        # 等待线程结束
+        recording_thread.join(timeout=1)
+        transcription_thread.join(timeout=1)
         p.terminate()
 
 if __name__ == "__main__":
