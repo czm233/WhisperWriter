@@ -18,6 +18,8 @@ logging.basicConfig(
     format='%(asctime)s:%(levelname)s:%(message)s'
 )
 
+global_initial_prompt = "这段音频可能包含技术术语，如 Vue.js、JavaScript、Node.js、Vue、React、Django、Drf、Python等等"
+
 # ========== 1. Whisper 模型初始化 ==========
 def init_whisper_model(model_name="medium", device=None):
     """
@@ -64,7 +66,7 @@ def record_audio(p,
                 channels=1,
                 format_=pyaudio.paInt16,
                 vad_mode=3,
-                silence_duration_threshold=0.3):
+                silence_duration_threshold=0.5):
     """
     持续录音，基于 VAD 判断语音活动，
     当检测到语音结束时，将语音片段提交到队列。
@@ -142,7 +144,7 @@ def transcribe_audio(model, audio_queue, stop_event, language="zh", fp16=False):
 
             # Whisper 期望的输入是 float32 的音频数组，采样率为 16000 Hz
             # 确保音频片段符合要求
-            result = model.transcribe(audio_array, language=language, fp16=fp16)
+            result = model.transcribe(audio_array, language=language, fp16=fp16, initial_prompt=global_initial_prompt)
             text = result["text"].strip()
             if text:
                 print(f"识别结果: {text}")
@@ -159,7 +161,7 @@ def main():
     # 初始化 PyAudio
     p = pyaudio.PyAudio()
     # 初始化 Whisper 模型（可根据需求改成 "tiny", "small", "medium", "large"）
-    model = init_whisper_model("large")
+    model = init_whisper_model("turbo")
 
     audio_queue = queue.Queue()
     stop_event = threading.Event()
