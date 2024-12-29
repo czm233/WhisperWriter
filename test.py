@@ -1,43 +1,28 @@
-import whisper
-import torch
+import threading
+import queue
 import pyaudio
-import numpy as np
 import wave
 import io
 import time
-import threading
-import queue
+import whisper
+import torch
+import numpy as np
 import logging
 
-# 配置日志
 logging.basicConfig(filename='transcription_errors.log',
                     level=logging.ERROR,
                     format='%(asctime)s:%(levelname)s:%(message)s')
 
-# ===========================
-# 1. 初始化 Whisper 模型
-# ===========================
-
-def init_whisper_model(model_name="large", device=None):
-    """
-    初始化 Whisper 模型。
-    :param model_name: Whisper 模型名称，如 'large', 'medium', 'small' 等
-    :param device: 指定使用的设备 'cuda' 或 'cpu'
-    :return: 加载好的 whisper 模型
-    """
+def init_whisper_model(model_name="small", device=None):
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
-    model = whisper.load_model(model_name).to(device)
-    return model
+    return whisper.load_model(model_name).to(device)
 
-# ===========================
-# 2. 录音函数
-# ===========================
-
-def record_audio(p, audio_queue, record_seconds=2, rate=16000, chunk=1024, channels=1, format_=pyaudio.paInt16):
+def record_audio(p, audio_queue, stop_event, record_seconds=2, rate=16000, chunk=1024, channels=1, format_=pyaudio.paInt16):
     """
-    持续录制音频，并将录制的音频块放入队列中。
+    持续录音，每段时长 record_seconds 秒，将得到的音频字节流放入 audio_queue。
+    当 stop_event 被设置时，退出循环并停止录音。
     """
     stream = p.open(format=format_,
                     channels=channels,
@@ -45,32 +30,37 @@ def record_audio(p, audio_queue, record_seconds=2, rate=16000, chunk=1024, chann
                     input=True,
                     frames_per_buffer=chunk)
     print("录音线程已启动。")
+
     try:
-        while True:
+        while not stop_event.is_set():
             frames = []
             for _ in range(0, int(rate / chunk * record_seconds)):
+                # 如果 stop_event 在这期间被设置了，就早点退出循环
+                if stop_event.is_set():
+                    break
                 data = stream.read(chunk, exception_on_overflow=False)
                 frames.append(data)
-            # 将录音数据转换为 WAV 字节流
-            wav_buffer = io.BytesIO()
-            with wave.open(wav_buffer, 'wb') as wf:
-                wf.setnchannels(channels)
-                wf.setsampwidth(p.get_sample_size(format_))
-                wf.setframerate(rate)
-                wf.writeframes(b''.join(frames))
-            audio_data = wav_buffer.getvalue()
-            # 将音频数据放入队列
-            audio_queue.put(audio_data)
+
+            if frames:
+                # 将录音数据转换为 WAV 字节流
+                wav_buffer = io.BytesIO()
+                with wave.open(wav_buffer, 'wb') as wf:
+                    wf.setnchannels(channels)
+                    wf.setsampwidth(p.get_sample_size(format_))
+                    wf.setframerate(rate)
+                    wf.writeframes(b''.join(frames))
+                audio_data = wav_buffer.getvalue()
+                audio_queue.put(audio_data)
+
     except Exception as e:
         logging.error(f"录音线程出现错误: {e}")
+
     finally:
-        stream.stop_stream()
+        # 这里要检查一下流是否还打开再关闭，避免二次 close
+        if stream.is_active():
+            stream.stop_stream()
         stream.close()
         print("录音线程已停止。")
-
-# ===========================
-# 3. WAV 字节流转换为 NumPy 数组
-# ===========================
 
 def wav_bytes_to_float32(audio_bytes):
     """
@@ -95,28 +85,24 @@ def wav_bytes_to_float32(audio_bytes):
 
     return audio_float32, framerate
 
-# ===========================
-# 4. 转录函数
-# ===========================
-
 def transcribe_audio(model, audio_queue, stop_event, language="zh", fp16=False):
     """
-    从音频队列中获取音频数据并进行转录。
+    转录线程：持续从 audio_queue 中获取音频数据并调用 Whisper 转写。
     """
     print("转录线程已启动。")
     while not stop_event.is_set():
         try:
-            # 尝试获取音频数据，超时可避免阻塞退出
-            audio_data = audio_queue.get(timeout=1)
+            audio_data = audio_queue.get(timeout=0.5)
         except queue.Empty:
-            continue
+            continue  # 如果没取到数据就重试
 
         try:
             audio_array, sample_rate = wav_bytes_to_float32(audio_data)
-            # Whisper expects audio to be 16000 Hz; resample if necessary
+            # 如果采样率不是 16000，需要重采样
             if sample_rate != 16000:
                 import librosa
                 audio_array = librosa.resample(audio_array, orig_sr=sample_rate, target_sr=16000)
+
             result = model.transcribe(audio_array, language=language, fp16=fp16)
             text = result["text"].strip()
 
@@ -125,48 +111,51 @@ def transcribe_audio(model, audio_queue, stop_event, language="zh", fp16=False):
                 print("-" * 40)
             else:
                 print("未识别到有效文本。")
+
         except Exception as e:
             logging.error(f"转录线程出现错误: {e}")
             print("转录过程中出现错误，检查日志以获取详细信息。")
+
     print("转录线程已停止。")
 
-# ===========================
-# 5. 主函数
-# ===========================
-
 def main():
-    # 初始化 PyAudio
     p = pyaudio.PyAudio()
+    model = init_whisper_model("small")
 
-    # 初始化 Whisper 模型
-    model = init_whisper_model(model_name="large")  # 可以根据需求调整模型大小
-
-    # 创建一个线程安全的队列用于传递音频数据
     audio_queue = queue.Queue()
-
-    # 创建一个事件用于停止线程
     stop_event = threading.Event()
 
-    # 启动录音线程
-    recording_thread = threading.Thread(target=record_audio, args=(p, audio_queue), daemon=True)
+    # 录音线程
+    recording_thread = threading.Thread(
+        target=record_audio,
+        args=(p, audio_queue, stop_event),
+        daemon=True
+    )
     recording_thread.start()
 
-    # 启动转录线程
-    transcription_thread = threading.Thread(target=transcribe_audio, args=(model, audio_queue, stop_event), daemon=True)
+    # 转录线程
+    transcription_thread = threading.Thread(
+        target=transcribe_audio,
+        args=(model, audio_queue, stop_event),
+        daemon=True
+    )
     transcription_thread.start()
 
     print("开始实时语音翻译...按 Ctrl+C 结束。")
+
     try:
         while True:
-            time.sleep(0.1)  # 主线程保持活跃
+            time.sleep(0.1)
     except KeyboardInterrupt:
         print("停止实时语音翻译。")
+        # 通知子线程退出
         stop_event.set()
     finally:
-        # 等待线程结束
-        recording_thread.join(timeout=1)
-        transcription_thread.join(timeout=1)
+        # 等待线程退出
+        recording_thread.join(timeout=2)
+        transcription_thread.join(timeout=2)
         p.terminate()
+        print("主线程已退出。")
 
 if __name__ == "__main__":
     main()
